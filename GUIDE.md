@@ -6,7 +6,7 @@ Bootloader stays locked, dm-verity stays enforcing. Tested on one phone, 5 Nov 2
 
 This is a simplified, fixed-up walk-through of josharrington's method
 ([josharrington/zenfone9-lineageos](https://github.com/josharrington/zenfone9-lineageos)).
-Read his [safety warnings](docs/15-install-guide.md) and [how it works](docs/14-lineage-booted.md) first.
+Read his [safety warnings](https://github.com/josharrington/zenfone9-lineageos/blob/main/docs/15-install-guide.md) and [how it works](https://github.com/josharrington/zenfone9-lineageos/blob/main/docs/14-lineage-booted.md) first (copies are also in `docs/`).
 
 > **Risks.** This erases all data. There is no verified EDL unbrick path. You keep a private
 > signing key (`zf9\key.pem`): lose it and you can only restore stock. Do this on a phone you can lose.
@@ -57,8 +57,6 @@ py -3 scripts\install_lineage_locked.py finish
    Ignore its Magisk wording at the end. The app should show **Working · LKM**.
    If it does not, repeat step 3 with `android13-5.10`.
 5. Run `zf9-sync.cmd` once. It should say *phone is in sync*, and it saves a last-known-good copy
-   to `zf9\current\` (used by the recovery command in section 6).
-5. Run `zf9-sync.cmd` once. It should say *phone is in sync* and saves a last-known-good copy
    to `zf9\current\` (used by the recovery command in section 6).
 
 ## 3. Metamodule (required before any module can mount files)
@@ -140,4 +138,4 @@ Never: OTA updates, recovery sideloads, GApps/mod zips in recovery, KernelSU *Di
 - **MindTheGapps** for the GApps package; **backslashxx & KOWX712** for mountify.
 - **ssut** for payload-dumper-go; **Google/AOSP** for AVB/libavb; **topjohnwu** for Magisk.
 - **libxzr** for KonaBess (optional GPU tuning).
-- Fixes, testing and this guide: **[YOUR XDA NAME]**, with **Claude (Anthropic)** as AI assistant.
+- Fixes, testing and this guide: **Ric89925**, with **Claude (Anthropic)** as AI assistant.

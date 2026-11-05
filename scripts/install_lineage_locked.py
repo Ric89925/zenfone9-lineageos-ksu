@@ -18,6 +18,10 @@ Subcommands
   unroot    restore the unpatched Lineage boot chain
   verify    read the device state (adb or fastboot)
   restore   download missing stock images, then put the stock images back
+  sync      after KonaBess / KernelSU update: re-sign vbmeta for the live boot chain
+  resign    flash boot/dtbo/vendor_boot (custom or stock) + matching signed vbmeta
+  finish    resume from fastbootd: empty super, write logical partitions,
+            flash the Lineage boot chain, reboot
 
 `prepare`, `install`, and `restore` download only the image sets they need. Use
 `--no-download` to stop instead of downloading. Use `download` to fetch images in
@@ -390,23 +394,61 @@ def chain_descriptor(name: str, rloc: int, pubkey: bytes) -> bytes:
     return struct.pack(BE + "QQ", 4, len(body)) + body
 
 
+def avb_image_len(name: str, path: Path) -> int:
+    """Bytes the bootloader actually verifies for this image.
+
+    The ZenFone 9 ABL loads vendor_boot and dtbo by the length in their headers, not
+    the whole partition, so a descriptor over a full-partition dump never matches
+    (tested 2026-11-05: 'avb check failed'). boot keeps the file length, which is
+    what the KernelSU/Magisk path has always used and is proven to boot.
+    """
+    with path.open("rb") as f:
+        head = f.read(8192)
+    fsize = path.stat().st_size
+    if name == "vendor_boot":
+        if head[:8] != b"VNDRBOOT":
+            die(f"{path}: not a vendor_boot image")
+        ver, page = struct.unpack_from("<II", head, 8)
+        vrd = struct.unpack_from("<I", head, 24)[0]
+        o = 28 + 2048 + 4 + 16
+        hdr, dtb = struct.unpack_from("<II", head, o)
+        al = lambda x: (x + page - 1) // page * page
+        n = al(hdr) + al(vrd) + al(dtb)
+        if ver >= 4:
+            tbl, _, _, bc = struct.unpack_from("<IIII", head, o + 16)
+            n += al(tbl) + al(bc)
+    elif name == "dtbo":
+        if head[:4] != b"\xd7\xb7\xab\x1e":
+            die(f"{path}: not a dtbo image")
+        n = (struct.unpack_from(">I", head, 4)[0] + 4095) // 4096 * 4096  # AVB pads to 4 KiB
+    else:
+        n = fsize
+    if not 0 < n <= fsize:
+        die(f"{path}: header length {n} is outside the file ({fsize} bytes)")
+    return n
+
+
 def hash_descriptor(name: str, path: Path, salt: bytes = b"",
-                    flags: int = 0) -> bytes:
-    """AVB hash descriptor for an image that has no embedded vbmeta of its own.
+                    flags: int = 0, length: int | None = None) -> bytes:
+    """AVB hash descriptor over the first `length` bytes of an image (default: all).
 
     Magisk removes or rewrites the boot image's AVB footer, so its old descriptor
-    cannot be reused. The top-level vbmeta stays authoritative: hashing the whole
-    patched image keeps verification enabled (`--flags 0`).
+    cannot be reused. The top-level vbmeta stays authoritative: hashing the
+    image keeps verification enabled (`--flags 0`).
     """
     data = path.read_bytes()
+    if length is not None:
+        data = data[:length]
     n = name.encode()
     digest = hashlib.sha256(salt + data).digest()
     body = (struct.pack(BE + "Q", len(data))
             + b"sha256".ljust(32, b"\0")
             + struct.pack(BE + "IIII", len(n), len(salt), len(digest), flags)
             + b"\0" * 60 + n + salt + digest)
-    raw = struct.pack(BE + "QQ", 2, len(body)) + body
-    return raw + b"\0" * ((8 - len(raw) % 8) % 8)
+    # libavb rejects a descriptor whose num_bytes_following is not a multiple of 8,
+    # so the padding must be counted in the header (as avbtool does).
+    body += b"\0" * ((8 - len(body) % 8) % 8)
+    return struct.pack(BE + "QQ", 2, len(body)) + body
 
 
 def verify_hash_descriptor(path: Path, raw: bytes) -> None:
@@ -418,8 +460,9 @@ def verify_hash_descriptor(path: Path, raw: bytes) -> None:
     name = raw[132:132 + nl].decode()
     salt = bytes(raw[132 + nl:132 + nl + sl])
     digest = bytes(raw[132 + nl + sl:132 + nl + sl + dl])
-    if (size != path.stat().st_size
-            or hashlib.sha256(salt + path.read_bytes()).digest() != digest):
+    data = path.read_bytes()
+    if (size > len(data)
+            or hashlib.sha256(salt + data[:size]).digest() != digest):
         die(f"{path}: hash descriptor does not match the image")
     ok(f"hash descriptor verifies: {name} ({size} bytes)")
 
@@ -476,6 +519,15 @@ def build_vbmeta(descriptors: list[bytes], key_pem: Path, pubkey: bytes,
 
 def verify_vbmeta_blob(d: bytes, pubkey: bytes, name: str) -> None:
     h = vbmeta_header(d)
+    base = 256 + h["auth"]
+    q, end = base + h["desc_off"], base + h["desc_off"] + h["desc_size"]
+    while q < end:                       # libavb's descriptor rules, checked strictly
+        if q + 16 > end:
+            die(f"{name}: truncated descriptor at {q}")
+        tag, nb = struct.unpack_from(BE + "QQ", d, q)
+        if nb % 8 or q + 16 + nb > end:
+            die(f"{name}: descriptor tag {tag} has invalid size {nb} (libavb rejects this)")
+        q += 16 + nb
     base = 256 + h["auth"]
     stored = d[256 + h["hash_off"]:256 + h["hash_off"] + h["hash_size"]]
     calc = hashlib.sha256(d[:256] + d[base:base + h["aux"]]).digest()
@@ -850,7 +902,8 @@ def build_rec(ctx: Ctx) -> dict[str, Path]:
 
 
 def build_lineage(ctx: Ctx, pub: bytes,
-                  boot_descriptor: bytes | None = None) -> dict[str, Path]:
+                  boot_descriptor: bytes | None = None,
+                  overrides: dict[str, bytes] | None = None) -> dict[str, Path]:
     info("checking Lineage boot + vendor images")
     lin = ctx.lineage
     for name in ("boot", "dtbo", "vendor_boot", "vendor", "odm", "vendor_dlkm",
@@ -864,8 +917,12 @@ def build_lineage(ctx: Ctx, pub: bytes,
         lin_descs += descriptors_from_image(lin / "boot.img", tags=(1, 2))
     else:
         lin_descs.append(boot_descriptor)
+    overrides = overrides or {}
     for name in ("dtbo", "vendor_boot"):
-        lin_descs += descriptors_from_image(lin / f"{name}.img", tags=(1, 2))
+        if name in overrides:
+            lin_descs.append(overrides[name])
+        else:
+            lin_descs += descriptors_from_image(lin / f"{name}.img", tags=(1, 2))
     for name in ("vendor", "odm", "vendor_dlkm"):
         lin_descs += descriptors_from_image(lin / f"{name}.img", tags=(1, 2))
     lin_descs += [
@@ -1229,23 +1286,85 @@ def flash_parts(ctx: Ctx, slot: str) -> None:
     flash(ctx, f"vbmeta_{slot}", ctx.out / "vbmeta_lineage.img")
 
 
-def install_logical(ctx: Ctx, slot: str) -> None:
-    total = 0
-    for name in LOGICAL:
-        img = ctx.images / "lineage" / f"{name}.img"
-        need(img, "Lineage logical image")
-        total += img.stat().st_size
+def list_logical(ctx: Ctx) -> dict[str, int]:
+    """Every logical partition currently in super (all slots, -cow included)."""
+    p = ctx.fastboot("getvar", "all", check=False, timeout=120)
+    text = (p.stdout or "") + (p.stderr or "")
+    sizes = {m.group(1): int(m.group(2), 16)
+             for m in re.finditer(r"partition-size:([^:\s]+):\s*0x([0-9a-fA-F]+)", text)}
+    names = sorted(set(re.findall(r"is-logical:([^:\s]+):\s*yes", text)))
+    return {n: sizes.get(n, 0) for n in names}
+
+
+def rewrite_super(ctx: Ctx, slot: str, src: Path, label: str) -> None:
+    """Empty super completely, then create + flash the six partitions largest-first.
+
+    The original code deleted only `<name>_<slot>`. Leftovers from the other slot,
+    orphaned Virtual A/B `*-cow` partitions (their tracking lives in /metadata,
+    which `fastboot -w` erases) or extra partitions kept that space reserved, and
+    create-logical-partition then failed with 'Not enough space for partition'.
+    """
+    imgs = {n: src / f"{n}.img" for n in LOGICAL}
+    for n, img in imgs.items():
+        need(img, f"{label} logical image")
+        with img.open("rb") as f:
+            if f.read(4) == b"\x3a\xff\x26\xed":
+                die(f"{img} is a sparse image; its file size is not the partition size")
+    total = sum(i.stat().st_size for i in imgs.values())
     check_super(ctx, total)
 
-    info(f"writing {len(LOGICAL)} logical partitions ({total} bytes)")
-    # Delete all first so the old partitions do not reserve space in `super`.
-    for name in LOGICAL:
-        ctx.fastboot("delete-logical-partition", f"{name}_{slot}", check=False)
-    for name in LOGICAL:
-        img = ctx.images / "lineage" / f"{name}.img"
-        ctx.fastboot("create-logical-partition", f"{name}_{slot}", str(img.stat().st_size))
-    for name in LOGICAL:
-        flash(ctx, f"{name}_{slot}", ctx.images / "lineage" / f"{name}.img")
+    info("cancelling any Virtual A/B snapshot state")
+    ctx.fastboot("snapshot-update", "cancel", check=False)
+
+    existing = list_logical(ctx)
+    if existing:
+        info(f"deleting ALL {len(existing)} logical partitions in super "
+             f"(both slots, *-cow, extras)")
+        for n, sz in sorted(existing.items(), key=lambda kv: -kv[1]):
+            say(f"   {n:<28} {sz:>15,} B")
+        ctx.confirm("Delete every logical partition listed above? The other slot "
+                    "will no longer boot until it is reflashed.")
+        for n in existing:
+            ctx.fastboot("delete-logical-partition", n, check=False)
+    if not ctx.dry:
+        left = list_logical(ctx)
+        if left:
+            die("super still has logical partitions after delete: "
+                + ", ".join(f"{n} ({s:,} B)" for n, s in left.items())
+                + "\nSend the output of `fastboot getvar all` for diagnosis.")
+        ok("super is empty")
+
+    order = sorted(LOGICAL, key=lambda n: -imgs[n].stat().st_size)
+    info(f"creating {len(order)} logical partitions largest-first ({total:,} B)")
+    for n in order:
+        ctx.fastboot("create-logical-partition", f"{n}_{slot}",
+                     str(imgs[n].stat().st_size))
+    for n in order:
+        flash(ctx, f"{n}_{slot}", imgs[n])
+
+
+def install_logical(ctx: Ctx, slot: str) -> None:
+    rewrite_super(ctx, slot, ctx.images / "lineage", "Lineage")
+
+
+def finish(ctx: Ctx) -> None:
+    """Resume an install that already finished stage 1 + wipe: phone in fastbootd."""
+    ensure_images(ctx, STOCK_PREPARE, LINEAGE_PARTS)
+    if not (ctx.out / "vbmeta_lineage.img").exists() or not (ctx.out / "recovery_ours.img").exists():
+        prepare(ctx)
+    if not ctx.probe_fastboot(want_userspace=True):
+        die("finish expects the phone in fastbootd (Lineage Recovery -> Advanced -> "
+            "Reboot to fastbootd)")
+    slot = select_slot(ctx)
+    ctx.confirm(f"Rewrite super and finish the Lineage install on slot {slot}?")
+    install_logical(ctx, slot)
+    info("back to the bootloader")
+    ctx.fastboot("reboot", "bootloader", check=False)
+    ctx.wait_fastboot(userspace=False, timeout=180)
+    flash_parts(ctx, slot)
+    info("rebooting into LineageOS (first boot can take several minutes)")
+    ctx.fastboot("reboot", check=False)
+    ok("finish done")
 
 
 def install(ctx: Ctx) -> None:
@@ -1417,6 +1536,217 @@ def root(ctx: Ctx) -> None:
     say("   then run `unroot`.")
 
 
+def confirm_boot_and_save(ctx: Ctx, imgs: dict[str, Path], vbmeta: Path,
+                          recover_hint: str) -> None:
+    """Wait for Android, check verity/lock state, then record the chain as last-known-good."""
+    info("waiting up to 5 minutes for Android to finish booting")
+    ctx.selector = None
+    deadline = time.time() + 300
+    booted = False
+    while time.time() < deadline:
+        if wait_for_adb(ctx, 10) and ctx.adb_getprop("sys.boot_completed") == "1":
+            booted = True
+            break
+        time.sleep(5)
+    if not booted:
+        die("phone did not finish booting (or adb is not authorized).\n" + recover_hint)
+    checks = {"ro.boot.veritymode": "enforcing", "ro.boot.flash.locked": "1",
+              "ro.boot.vbmeta.device_state": "locked"}
+    bad = [f"{k}={ctx.adb_getprop(k)!r}" for k, v in checks.items() if ctx.adb_getprop(k) != v]
+    if bad:
+        die("booted, but: " + ", ".join(bad))
+    cur = ctx.work / "current"
+    cur.mkdir(exist_ok=True)
+    for n, src in imgs.items():
+        shutil.copyfile(src, cur / f"{n}.img")
+    shutil.copyfile(vbmeta, cur / "vbmeta.img")
+    ok(f"booted; verity enforcing; bootloader locked; last-known-good chain saved to {cur}")
+
+
+RECOVER = ("  Hold Vol Down + Power for the bootloader, then restore the last good chain:\n"
+           "  py -3 scripts\\install_lineage_locked.py resign --boot-img zf9\\current\\boot.img"
+           " --vendor-boot-img zf9\\current\\vendor_boot.img --dtbo-img zf9\\current\\dtbo.img\n"
+           "  (no arguments = clean stock Lineage chain, no root)")
+
+
+def resign(ctx: Ctx) -> None:
+    """Flash boot, dtbo and vendor_boot from the given (or stock Lineage) images and a
+    vbmeta signed over exactly those bytes. Use after KonaBess or any boot-chain edit.
+    With no image options it restores the clean Lineage boot chain (superset of unroot)."""
+    if not ctx.key.exists():
+        die(f"resign needs the AVB private key that matches avb_custom_key: {ctx.key}")
+    if ctx.dry:
+        die("resign does not support --dry-run")
+    ensure_images(ctx, [], ROOT_PARTS)
+    pub = gen_key(ctx)
+    chosen = {
+        "boot": ctx.args.boot_img,
+        "vendor_boot": ctx.args.vendor_boot_img,
+        "dtbo": ctx.args.dtbo_img,
+    }
+    imgs: dict[str, Path] = {}
+    descs: dict[str, bytes] = {}
+    for name, given in chosen.items():
+        if given:
+            img = Path(given).expanduser().resolve()
+            need(img, f"{name} image")
+            if name != "dtbo":
+                with img.open("rb") as f:
+                    if f.read(8) not in (b"ANDROID!", b"VNDRBOOT"):
+                        die(f"{img}: not a {name} image (bad magic)")
+            descs[name] = hash_descriptor(name, img, length=avb_image_len(name, img))
+            verify_hash_descriptor(img, descs[name])
+            info(f"{name}: custom image {img}")
+        else:
+            img = ctx.lineage / f"{name}.img"
+            info(f"{name}: stock Lineage image")
+        imgs[name] = img
+    art = build_lineage(ctx, pub, boot_descriptor=descs.get("boot"),
+                        overrides={k: v for k, v in descs.items() if k != "boot"})
+    if ctx.args.patch_only:
+        ok(f"vbmeta ready, not flashing (--patch-only): {art['vbmeta_lineage']}")
+        return
+    ensure_bootloader(ctx)
+    slot = check_device(ctx)
+    ctx.confirm(f"Flash boot/dtbo/vendor_boot + re-signed vbmeta to slot {slot}? Data is kept.")
+    for name in ("boot", "dtbo", "vendor_boot"):
+        check_image_fits(ctx, f"{name}_{slot}", imgs[name])
+    for name in ("boot", "dtbo", "vendor_boot"):
+        flash(ctx, f"{name}_{slot}", imgs[name])
+    flash(ctx, f"vbmeta_{slot}", art["vbmeta_lineage"])   # last, so the chain matches
+    ctx.fastboot("reboot", check=False)
+    ok("flashed; the boot chain on the phone now matches the signed vbmeta")
+    confirm_boot_and_save(ctx, imgs, art["vbmeta_lineage"], RECOVER)
+
+
+SYNC_PARTS = ("boot", "vendor_boot", "dtbo")
+SYNC_MAGIC = {"boot": (b"ANDROID!",), "vendor_boot": (b"VNDRBOOT",),
+              "dtbo": (b"\xd7\xb7\xab\x1e",)}
+
+
+def parse_hash_desc(raw: bytes) -> dict:
+    size = struct.unpack_from(BE + "Q", raw, 16)[0]
+    alg = raw[24:56].rstrip(b"\0").decode()
+    nl, sl, dl, _ = struct.unpack_from(BE + "IIII", raw, 56)
+    name = raw[132:132 + nl].decode()
+    salt = bytes(raw[132 + nl:132 + nl + sl])
+    digest = bytes(raw[132 + nl + sl:132 + nl + sl + dl])
+    return {"size": size, "alg": alg, "name": name, "salt": salt, "digest": digest}
+
+
+def su_shell(ctx: Ctx, cmd: str, check: bool = True) -> str:
+    p = ctx.adb("shell", f"su -c '{cmd}'", check=False)
+    out = ((p.stdout or "") + (p.stderr or "")).strip()
+    if check and p.returncode != 0:
+        die(f"root command failed: {cmd}\n{out}")
+    return out
+
+
+def dump_partition(ctx: Ctx, part: str, dest: Path) -> Path:
+    remote = f"/data/local/tmp/zf9sync_{part}.img"
+    su_shell(ctx, f"dd if=/dev/block/by-name/{part} of={remote} bs=4194304 2>/dev/null; "
+                  f"chmod 644 {remote}")
+    ctx.adb("pull", remote, str(dest))
+    su_shell(ctx, f"rm -f {remote}", check=False)
+    if not dest.is_file() or dest.stat().st_size == 0:
+        die(f"could not dump {part}")
+    return dest
+
+
+def sync(ctx: Ctx) -> None:
+    """Re-sign vbmeta for whatever is LIVE on boot/vendor_boot/dtbo (after KonaBess,
+    a KernelSU update, ...). Only vbmeta_<slot> is written; the key stays on the PC."""
+    if not ctx.key.exists():
+        die(f"sync needs the AVB private key that matches avb_custom_key: {ctx.key}")
+    if ctx.dry:
+        die("sync does not support --dry-run")
+    pub = gen_key(ctx)
+    check_lineage(ctx)
+    if "uid=0" not in su_shell(ctx, "id", check=False):
+        die("no root over adb: in the KernelSU Next app, grant root to Shell, then rerun")
+    sfx = ctx.adb_getprop("ro.boot.slot_suffix") or "_a"
+    slot = sfx.lstrip("_")
+
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    bdir = ctx.work / "backups" / f"sync-{stamp}"
+    bdir.mkdir(parents=True, exist_ok=True)
+    info(f"dumping live partitions (slot {slot}) to {bdir}")
+    live_vb = dump_partition(ctx, f"vbmeta{sfx}", bdir / "vbmeta.img")
+    live = {n: dump_partition(ctx, f"{n}{sfx}", bdir / f"{n}.img") for n in SYNC_PARTS}
+
+    vb = live_vb.read_bytes()
+    if vb[:4] != b"AVB0":
+        die("live vbmeta has no AVB0 header; refusing to touch an unknown state")
+    verify_vbmeta_blob(vb, pub, f"live vbmeta{sfx}")   # proves it is OUR signed vbmeta
+
+    descs = list(iter_descriptors(vb))
+    changed: dict[str, bytes] = {}
+    for tag, raw in descs:
+        if tag != 2:
+            continue
+        d = parse_hash_desc(raw)
+        if d["name"] not in live:
+            continue
+        data = live[d["name"]].read_bytes()
+        if d["alg"] != "sha256":
+            die(f"{d['name']}: unexpected hash algorithm {d['alg']}")
+        if len(data) < d["size"]:
+            die(f"{d['name']}: live partition smaller than signed image_size")
+        if hashlib.sha256(d["salt"] + data[:d["size"]]).digest() == d["digest"]:
+            ok(f"{d['name']}: matches signed vbmeta")
+            continue
+        if not data.startswith(SYNC_MAGIC[d["name"]]):
+            die(f"{d['name']}: changed AND has no valid image magic; it looks corrupt.\n"
+                f"  Do not reboot. Restore with: resign (see {bdir})")
+        warn(f"{d['name']}: CHANGED since last signing")
+        changed[d["name"]] = hash_descriptor(
+            d["name"], live[d["name"]], length=avb_image_len(d["name"], live[d["name"]]))
+        verify_hash_descriptor(live[d["name"]], changed[d["name"]])
+    missing = set(SYNC_PARTS) - {parse_hash_desc(r)["name"] for t, r in descs if t == 2}
+    if missing:
+        die(f"live vbmeta has no hash descriptor for: {', '.join(sorted(missing))}")
+    if not changed:
+        cur = ctx.work / "current"
+        cur.mkdir(exist_ok=True)
+        for n in SYNC_PARTS:
+            shutil.copyfile(live[n], cur / f"{n}.img")
+        shutil.copyfile(live_vb, cur / "vbmeta.img")
+        ok(f"phone is in sync; nothing to sign. Verified chain saved to {cur}")
+        return
+
+    # Same descriptors as the live vbmeta, with only the changed hash descriptors swapped.
+    new_descs = []
+    for tag, raw in descs:
+        if tag == 2 and parse_hash_desc(raw)["name"] in changed:
+            new_descs.append(changed[parse_hash_desc(raw)["name"]])
+        else:
+            new_descs.append(raw)
+    h = vbmeta_header(vb)
+    out = ctx.out / "vbmeta_sync.img"
+    build_vbmeta(new_descs, ctx.key, pub, out, flags=h["flags"], rollback=h["rollback"])
+    nb = out.read_bytes()
+    verify_vbmeta_blob(nb, pub, out.name)
+    for tag, raw in iter_descriptors(nb):          # every hash descriptor vs live bytes
+        if tag == 2:
+            d = parse_hash_desc(raw)
+            if d["name"] in live and hashlib.sha256(
+                    d["salt"] + live[d["name"]].read_bytes()[:d["size"]]).digest() != d["digest"]:
+                die(f"new vbmeta does not match live {d['name']}; nothing flashed")
+    if [t for t, _ in iter_descriptors(nb)] != [t for t, _ in descs]:
+        die("descriptor layout changed unexpectedly; nothing flashed")
+    ok(f"new vbmeta verified: re-signed {', '.join(sorted(changed))}; "
+       f"hashtree/chain descriptors copied unchanged")
+
+    ctx.confirm(f"Flash vbmeta{sfx} for the changed {', '.join(sorted(changed))}? "
+                "Only vbmeta is written.")
+    ctx.adb("reboot", "bootloader", check=False)
+    ctx.wait_fastboot(userspace=False, timeout=180)
+    flash(ctx, f"vbmeta{sfx}", out)
+    ctx.fastboot("reboot", check=False)
+
+    confirm_boot_and_save(ctx, live, out, RECOVER)
+
+
 def unroot(ctx: Ctx) -> None:
     if not ctx.key.exists():
         die(f"unroot needs the AVB private key that matches avb_custom_key: {ctx.key}\n"
@@ -1472,17 +1802,8 @@ def restore(ctx: Ctx) -> None:
     )
     slot = select_slot(ctx)
 
-    total = sum((ctx.stock / f"{n}.img").stat().st_size for n in LOGICAL)
-    check_super(ctx, total)
-    info(f"restoring logical partitions ({total} bytes)")
-    # Delete all first so the old partitions do not reserve space in `super`.
-    for name in LOGICAL:
-        ctx.fastboot("delete-logical-partition", f"{name}_{slot}", check=False)
-    for name in LOGICAL:
-        img = ctx.stock / f"{name}.img"
-        ctx.fastboot("create-logical-partition", f"{name}_{slot}", str(img.stat().st_size))
-    for name in LOGICAL:
-        flash(ctx, f"{name}_{slot}", ctx.stock / f"{name}.img")
+    info("restoring logical partitions")
+    rewrite_super(ctx, slot, ctx.stock, "stock")
 
     ctx.fastboot("reboot", "bootloader", check=False)
     ctx.wait_fastboot(userspace=False, timeout=180)
@@ -1621,7 +1942,7 @@ def main() -> None:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("command",
                     choices=["doctor", "download", "prepare", "install", "root",
-                             "unroot", "verify", "restore"])
+                             "unroot", "verify", "restore", "finish", "resign", "sync"])
     ap.add_argument("--workdir", default="./zf9")
     ap.add_argument("--images", default=None,
                     help="directory containing lineage/ and stock/ (default: <workdir>/images)")
@@ -1659,6 +1980,12 @@ def main() -> None:
     ap.add_argument("--preinit-device", default=None,
                     help="Magisk pre-init block device "
                          f"(default: {MAGISK_PREINIT_DEFAULT})")
+    ap.add_argument("--boot-img", default=None,
+                    help="resign: boot image to flash (e.g. KernelSU-patched); default Lineage boot")
+    ap.add_argument("--vendor-boot-img", default=None,
+                    help="resign: vendor_boot image to flash (e.g. pulled after KonaBess)")
+    ap.add_argument("--dtbo-img", default=None,
+                    help="resign: dtbo image to flash; default Lineage dtbo")
     ap.add_argument("--patch-only", action="store_true",
                     help="root: build the patched images but do not flash them")
     args = ap.parse_args()
@@ -1675,9 +2002,12 @@ def main() -> None:
         ap.error("--patched-boot is only valid with the root or doctor command")
     if args.patched_boot and args.preinit_device:
         ap.error("--preinit-device is not valid with --patched-boot")
-    if args.command != "root" and (args.preinit_device or args.patch_only):
-        ap.error("--preinit-device and --patch-only are only valid with the "
-                 "root command")
+    if args.command != "root" and args.preinit_device:
+        ap.error("--preinit-device is only valid with the root command")
+    if args.command not in ("root", "resign") and args.patch_only:
+        ap.error("--patch-only is only valid with the root or resign command")
+    if args.command != "resign" and (args.boot_img or args.vendor_boot_img or args.dtbo_img):
+        ap.error("--boot-img/--vendor-boot-img/--dtbo-img are only valid with resign")
 
     if args.serial:
         os.environ["ANDROID_SERIAL"] = args.serial
@@ -1697,6 +2027,12 @@ def main() -> None:
         say("   bootloader) and run `install`; it moves the phone to the bootloader.")
     elif args.command == "install":
         install(ctx)
+    elif args.command == "finish":
+        finish(ctx)
+    elif args.command == "resign":
+        resign(ctx)
+    elif args.command == "sync":
+        sync(ctx)
     elif args.command == "root":
         root(ctx)
     elif args.command == "unroot":

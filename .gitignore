@@ -13,3 +13,7 @@ zf9-lineage/
 key.pem
 __pycache__/
 *.pyc
+
+# Local diagnostics and sideloaded APKs
+diag/
+apks/

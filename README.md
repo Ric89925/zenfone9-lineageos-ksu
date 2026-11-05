@@ -1,3 +1,6 @@
+> **Fork note:** simplified, fixed-up guide (locked bootloader + KernelSU Next + GApps + Pixelify): **[GUIDE.md](GUIDE.md)**.
+> Built on josharrington's original work below; changes are listed at the end of the guide.
+
 # LineageOS on a locked ZenFone 9
 
 This repo documents a method to install LineageOS on the ASUS Zenfone 9 (WW/US version) running the latest available firmware without a bootloader unlock.

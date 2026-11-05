@@ -1,0 +1,111 @@
+[CENTER][SIZE=6][B][GUIDE] LineageOS 23.2 + KernelSU Next + GApps on a LOCKED bootloader (ZenFone 9 / AI2202)[/B][/SIZE]
+[I]Simplified, fixed-up version of josharrington's custom-AVB-key method. No unlock, no ASUS unlock tool.[/I][/CENTER]
+
+[B]What you get[/B]
+[LIST]
+[*]LineageOS 23.2 (Android 16) by Lynnrin, booting with the bootloader [B]still locked[/B] and dm-verity [B]enforcing[/B]
+[*]Root via KernelSU Next (LKM mode)
+[*]Google apps as a systemless module (verified partitions untouched)
+[*]A "Pixelify" script: Google Phone/Messages/Chrome/Gboard etc. as defaults, Lineage duplicates disabled (reversible)
+[*]One-command re-signing after KonaBess GPU edits or KernelSU updates
+[/LIST]
+
+[B]How it works (short)[/B]
+The ZenFone 9 bootloader accepts a user public key in [ICODE]avb_custom_key[/ICODE] while locked. You generate your own key, sign the boot chain with it, and the phone verifies LineageOS against your key. Nothing is forged or bypassed; the boot screen shows a "different OS" warning (yellow state). Full write-up: [URL='https://github.com/josharrington/zenfone9-lineageos/blob/main/docs/14-lineage-booted.md']How the locked-bootloader installation works[/URL] by josharrington.
+
+[COLOR=rgb(226, 80, 65)][B]WARNING[/B][/COLOR]
+[LIST]
+[*]Erases all data. No verified EDL unbrick path. Tested on [B]one[/B] WW AI2202 on firmware WW-34.0304.2004.145.
+[*]You keep a private signing key ([ICODE]zf9\key.pem[/ICODE]). Lose it and you can only restore stock. Back it up.
+[*]Play Integrity device/strong will usually fail (custom key = yellow state). Use your daily phone for banking/wallet.
+[*]No OTA. Never flash GApps/mod zips in recovery, never use KernelSU "Direct install".
+[/LIST]
+
+[SIZE=5][B]Downloads[/B][/SIZE]
+[LIST]
+[*][B]Everything (scripts + guide):[/B] [URL='[YOUR FORK URL]'][YOUR FORK URL][/URL] → open [ICODE]GUIDE.md[/ICODE]
+[*]Original project: [URL='https://github.com/josharrington/zenfone9-lineageos']josharrington/zenfone9-lineageos[/URL]
+[*]ROM: [URL='https://download.lynnrin.moe/ROM/ASUS%20Zenfone%209/LineageOS/']Lynnrin's LineageOS builds[/URL] (tested: rinko-23.2-20260810-UNOFFICIAL-davinci). The installer downloads it and checks its SHA-256.
+[*]ASUS firmware WW-34.0304.2004.145: [URL='https://www.asus.com/us/supportonly/zenfone%209/helpdesk_bios/']ASUS support[/URL]. Also auto-downloaded and checked.
+[*]KernelSU Next: [URL='https://github.com/KernelSU-Next/KernelSU-Next/releases/latest']releases[/URL]
+[*]mountify (metamodule): [URL='https://github.com/backslashxx/mountify']backslashxx/mountify[/URL]
+[*]MindTheGapps 16.0.0 arm64: [URL='https://github.com/MindTheGapps/16.0.0-arm64/releases']releases[/URL]
+[/LIST]
+No firmware, ROM or Google APKs are rehosted; scripts fetch or repack official files.
+
+[SIZE=5][B]Steps (Windows; Linux identical with python3)[/B][/SIZE]
+[B]0. Host setup[/B]
+Python 3, platform-tools, OpenSSL, payload-dumper-go and the ASUS USB driver: see [ICODE]docs/setup-windows.md[/ICODE]. Enable USB debugging on the phone.
+
+[B]1. LineageOS[/B]
+[CODE]py -3 scripts\install_lineage_locked.py doctor
+py -3 scripts\install_lineage_locked.py install[/CODE]
+First boot can stay black for several minutes. Interrupted while in fastbootd? Run [ICODE]py -3 scripts\install_lineage_locked.py finish[/ICODE]. Then back up [ICODE]zf9\key.pem[/ICODE] off your PC.
+
+[B]2. Root (KernelSU Next, LKM)[/B]
+[LIST=1]
+[*]Install the KernelSU Next manager APK.
+[*][ICODE]adb push zf9\images\lineage\boot.img /sdcard/Download/boot.img[/ICODE]
+[*]In the app: Install → [B]Select a file[/B] → that boot.img → KMI [B]android12-5.10[/B] (the kernel name has no androidXX tag, so it asks). [COLOR=rgb(226, 80, 65)]Never use Direct install / Install to inactive slot.[/COLOR]
+[*]Pull the patched image and sign + flash it:
+[CODE]adb pull /sdcard/Download/<kernelsu_next_patched_file>.img zf9\boot_ksun.img
+py -3 scripts\install_lineage_locked.py root --patched-boot .\zf9\boot_ksun.img[/CODE]
+Ignore the Magisk wording at the end. The app should show [B]Working · LKM[/B]. If not, redo step 3 with [B]android13-5.10[/B].
+[*]Run [ICODE]zf9-sync.cmd[/ICODE] once. It should say "phone is in sync" and saves a last-known-good chain to [ICODE]zf9\current[/ICODE].
+[/LIST]
+
+[B]3. Metamodule[/B]
+Install [B]mountify[/B] in KernelSU Next, reboot. It's required before any module can mount files. Only one metamodule at a time; switching removes all modules.
+
+[B]4. GApps (systemless)[/B]
+A normal GApps zip in recovery would modify verified partitions and break boot, so it's built as a module instead:
+[CODE]py -3 scripts\build_gapps_module.py MindTheGapps-16.0.0-arm64-XXXXXXXX_XXXXXX.zip
+adb push zf9\downloads\mtg_core_ksun.zip /sdcard/Download/[/CODE]
+Install it in KernelSU Next → reboot → check:
+[CODE]adb shell ls /product/priv-app/GmsCore
+adb shell pm path com.google.android.gms[/CODE]
+Then sign in: Settings → Passwords & accounts → Google.
+[I]Restoring app data without the setup wizard:[/I] [ICODE]adb shell bmgr list sets[/ICODE], then [ICODE]adb shell bmgr restore <token> <package> ...[/ICODE] for apps you reinstalled.
+
+[B]5. Pixelify[/B]
+[CODE]powershell -ExecutionPolicy Bypass -File .\zf9-pixelify.ps1[/CODE]
+Opens each missing Google app in the Play Store (tap Install, press Enter), makes Phone, Messages, Chrome and Gboard the defaults, then [B]disables[/B] (never deletes) the Lineage twins. [ICODE]-Undo[/ICODE] reverts, [ICODE]-Apply[/ICODE] re-applies after installing more apps.
+Optional sideloads (APKMirror, signature-verified): Pixel Weather, Google Recorder.
+
+[SIZE=5][B]Living with it[/B][/SIZE]
+[LIST]
+[*][B]After a KonaBess GPU edit or KernelSU Next update:[/B] don't reboot. Run [ICODE]zf9-sync.cmd[/ICODE], answer y. Only vbmeta is re-signed for what changed.
+[*][B]"avb check failed":[/B] Vol Down + Power (bootloader), then:
+[CODE]py -3 scripts\install_lineage_locked.py resign --boot-img zf9\current\boot.img --vendor-boot-img zf9\current\vendor_boot.img --dtbo-img zf9\current\dtbo.img[/CODE]
+[*][B]Clean Lineage, no root:[/B] [ICODE]py -3 scripts\install_lineage_locked.py resign[/ICODE]
+[*][B]Back to stock ASUS:[/B] [ICODE]py -3 scripts\install_lineage_locked.py restore[/ICODE]
+[*][B]A module bootloops:[/B] press Volume Down repeatedly during boot (KernelSU safe mode), then remove it.
+[/LIST]
+
+[SIZE=5][B]Known limitations[/B][/SIZE]
+[LIST]
+[*]Yellow boot state: boot warning screen; Play Integrity device/strong usually fail.
+[*]Slot b is emptied during install; no A/B fallback.
+[*]Updates = re-run the installer with a new build (no OTA).
+[*]Some GPU driver modules crash the Qualcomm media codec HAL on this ROM. Check with [ICODE]adb shell "su -c 'dmesg | grep -c c2-hal'"[/ICODE]; it should stay around 0.
+[/LIST]
+
+[SIZE=5][B]What's fixed vs. the original scripts[/B][/SIZE]
+[LIST]
+[*][ICODE]Not enough space for partition[/ICODE] in fastbootd (same symptom as upstream issue #4): the installer now cancels pending Virtual A/B snapshots, deletes [I]all[/I] logical partitions (other slot, orphaned [ICODE]*-cow[/ICODE]), verifies super is empty, then creates partitions largest-first.
+[*]AVB hash descriptor length wasn't padded to a multiple of 8. Harmless for [ICODE]boot[/ICODE], fatal for a re-signed [ICODE]vendor_boot[/ICODE] ("avb check failed"). Descriptors are now byte-identical to avbtool, and every vbmeta passes a strict libavb check before flashing.
+[*][ICODE]vendor_boot[/ICODE]/[ICODE]dtbo[/ICODE] are hashed over their header length (what the bootloader verifies), so KonaBess GPU edits can be re-signed.
+[*]New commands: [ICODE]finish[/ICODE] (resume from fastbootd), [ICODE]resign[/ICODE] (flash any boot/dtbo/vendor_boot with a matching signed vbmeta), [ICODE]sync[/ICODE] (re-sign after KonaBess/KernelSU changes). Plus the GApps module builder and the Pixelify script.
+[/LIST]
+
+[SIZE=5][B]Credits[/B][/SIZE]
+[LIST]
+[*][B]josharrington[/B]: the method, installer and documentation this is built on
+[*][B]Lynnrin (rinko)[/B]: unofficial LineageOS 23.2 for the ZenFone 9 ([URL='https://xdaforums.com/t/rom-16-unofficial-davinci-ai2202-lineageos-23-2-for-asus-zenfone-9.4789947/']ROM thread[/URL])
+[*][B]LineageOS[/B] project · [B]ASUS[/B] (firmware)
+[*][B]KernelSU Next[/B] team (rifsxd & contributors) · [B]KernelSU[/B] (tiann)
+[*][B]MindTheGapps[/B] · [B]backslashxx & KOWX712[/B] (mountify)
+[*][B]ssut[/B] (payload-dumper-go) · [B]Google/AOSP[/B] (AVB/libavb) · [B]topjohnwu[/B] (Magisk) · [B]libxzr[/B] (KonaBess)
+[*]Fixes, testing, guide: [B][YOUR XDA NAME][/B], with [B]Claude (Anthropic)[/B] as AI assistant
+[/LIST]
+Not affiliated with ASUS, LineageOS or any project above. Use at your own risk.
